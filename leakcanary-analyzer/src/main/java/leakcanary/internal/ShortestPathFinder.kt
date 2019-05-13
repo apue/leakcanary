@@ -15,16 +15,23 @@
  */
 package leakcanary.internal
 
+import leakcanary.AnalyzerProgressListener
+import leakcanary.AnalyzerProgressListener.Step.CALCULATING_RETAINED_SIZE
+import leakcanary.AnalyzerProgressListener.Step.FINDING_DOMINATORS
+import leakcanary.AnalyzerProgressListener.Step.FINDING_SHORTEST_PATHS
+import leakcanary.CanaryLog
 import leakcanary.Exclusion
 import leakcanary.Exclusion.ExclusionType.InstanceFieldExclusion
 import leakcanary.Exclusion.ExclusionType.StaticFieldExclusion
 import leakcanary.Exclusion.ExclusionType.ThreadExclusion
 import leakcanary.Exclusion.Status
 import leakcanary.Exclusion.Status.NEVER_REACHABLE
+import leakcanary.Exclusion.Status.WEAKLY_REACHABLE
 import leakcanary.ExclusionsFactory
 import leakcanary.HeapValue
 import leakcanary.HeapValue.ObjectReference
 import leakcanary.HprofParser
+import leakcanary.HprofReader
 import leakcanary.LeakNode
 import leakcanary.LeakNode.ChildNode
 import leakcanary.LeakNode.RootNode
@@ -32,16 +39,27 @@ import leakcanary.LeakReference
 import leakcanary.LeakTraceElement.Type.ARRAY_ENTRY
 import leakcanary.LeakTraceElement.Type.INSTANCE_FIELD
 import leakcanary.LeakTraceElement.Type.STATIC_FIELD
+import leakcanary.ObjectIdMetadata.CLASS
 import leakcanary.ObjectIdMetadata.EMPTY_INSTANCE
 import leakcanary.ObjectIdMetadata.PRIMITIVE_ARRAY_OR_WRAPPER_ARRAY
 import leakcanary.ObjectIdMetadata.PRIMITIVE_WRAPPER
 import leakcanary.ObjectIdMetadata.STRING
+import leakcanary.Record
 import leakcanary.Record.HeapDumpRecord.ObjectRecord.ClassDumpRecord
 import leakcanary.Record.HeapDumpRecord.ObjectRecord.InstanceDumpRecord
 import leakcanary.Record.HeapDumpRecord.ObjectRecord.ObjectArrayDumpRecord
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.BooleanArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.ByteArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.CharArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.DoubleArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.FloatArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.IntArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.LongArrayDump
+import leakcanary.Record.HeapDumpRecord.ObjectRecord.PrimitiveArrayDumpRecord.ShortArrayDump
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 import java.util.PriorityQueue
+import kotlin.reflect.KClass
 
 /**
  * Not thread safe.
@@ -72,19 +90,32 @@ internal class ShortestPathFinder {
   private val visitedSet = LinkedHashSet<Long>()
   private lateinit var referentMap: Map<Long, KeyedWeakReferenceMirror>
   private var visitOrder = 0
+  /**
+   * Instances that cannot be dominated by a leaking instance because they're dominated by an
+   * ancestor of a leaking instance.
+   */
+  private val undominatedSet = LinkedHashSet<Long>()
+  /**
+   * Map of instances to their leaking dominator.
+   */
+  private val dominatedInstances = LinkedHashMap<Long, Long>()
 
-  internal class Result(
+  internal data class Result(
     val leakingNode: LeakNode,
     val exclusionStatus: Status?,
-    val weakReference: KeyedWeakReferenceMirror
+    val weakReference: KeyedWeakReferenceMirror,
+    val retainedHeapSize: Int?
   )
 
   fun findPaths(
     parser: HprofParser,
     exclusionsFactory: ExclusionsFactory,
     leakingWeakRefs: List<KeyedWeakReferenceMirror>,
-    gcRootIds: MutableList<Long>
+    gcRootIds: MutableList<Long>,
+    computeRetainedHeapSize: Boolean,
+    listener: AnalyzerProgressListener
   ): List<Result> {
+    listener.onProgressUpdate(FINDING_SHORTEST_PATHS)
     clearState()
 
     val fieldNameByClassName = mutableMapOf<String, MutableMap<String, Exclusion>>()
@@ -127,8 +158,8 @@ internal class ShortestPathFinder {
     gcRootIds.clear()
 
     var lowestPriority = ALWAYS_REACHABLE
-    val results = mutableListOf<Result>()
-    while (!toVisitQueue.isEmpty()) {
+    val resultsFound = mutableListOf<Result>()
+    visitingQueue@ while (!toVisitQueue.isEmpty()) {
       val node = toVisitQueue.poll()!!
       val priority = toVisitMap[node.instance]!!
       // Lowest priority has the highest value
@@ -145,18 +176,88 @@ internal class ShortestPathFinder {
       val weakReference = referentMap[node.instance]
       if (weakReference != null) {
         val exclusionPriority = if (lowestPriority == ALWAYS_REACHABLE) null else lowestPriority
-        results.add(Result(node, exclusionPriority, weakReference))
-        // Found all refs, stop searching.
-        if (results.size == leakingWeakRefs.size) {
-          break
+        resultsFound.add(Result(node, exclusionPriority, weakReference, null))
+        // Found all refs, stop searching (unless computing retained size which stops on weak reachables)
+        if (resultsFound.size == leakingWeakRefs.size) {
+          if (computeRetainedHeapSize && lowestPriority < WEAKLY_REACHABLE) {
+            listener.onProgressUpdate(FINDING_DOMINATORS)
+          } else {
+            break@visitingQueue
+          }
         }
       }
 
       when (val record = parser.retrieveRecordById(node.instance)) {
-        is ClassDumpRecord -> visitClassRecord(parser, record, node, staticFieldNameByClassName)
-        is InstanceDumpRecord -> visitInstanceRecord(parser, record, node, fieldNameByClassName)
-        is ObjectArrayDumpRecord -> visitObjectArrayRecord(parser, record, node)
+        is ClassDumpRecord -> visitClassRecord(
+            parser, record, node, staticFieldNameByClassName, computeRetainedHeapSize
+        )
+        is InstanceDumpRecord -> visitInstanceRecord(
+            parser, record, node, fieldNameByClassName, computeRetainedHeapSize
+        )
+        is ObjectArrayDumpRecord -> visitObjectArrayRecord(
+            parser, record, node, computeRetainedHeapSize
+        )
       }
+    }
+
+    val results = if (computeRetainedHeapSize) {
+      listener.onProgressUpdate(CALCULATING_RETAINED_SIZE)
+      // TODO Check out NativeRegistryPostProcessor in perflib for native size computation
+      // TODO Figure out how bitmaps native memory is accounted for in perflib
+
+      val retainedCounts = LinkedHashMap<KClass<out Record>, Int>().withDefault { 0 }
+
+      val retainedSizes = LinkedHashMap<Long, Int>().withDefault { 0 }
+      dominatedInstances.forEach { (instanceId, dominatorId) ->
+        var retainedSize = retainedSizes.getValue(dominatorId)
+        val record = parser.retrieveRecordById(instanceId)
+        val kClass = record::class
+        retainedCounts[kClass] = retainedCounts.getValue(kClass) + 1
+        retainedSize += when (record) {
+          is InstanceDumpRecord -> {
+            val classRecord = parser.retrieveRecordById(record.classId) as ClassDumpRecord
+            // Note: instanceSize is the sum of shallow size through the class hierarchy
+            classRecord.instanceSize
+          }
+          is ObjectArrayDumpRecord -> record.elementIds.size * parser.idSize
+          is BooleanArrayDump -> record.array.size * HprofReader.BOOLEAN_SIZE
+          is CharArrayDump -> record.array.size * HprofReader.CHAR_SIZE
+          is FloatArrayDump -> record.array.size * HprofReader.FLOAT_SIZE
+          is DoubleArrayDump -> record.array.size * HprofReader.DOUBLE_SIZE
+          is ByteArrayDump -> record.array.size * HprofReader.BYTE_SIZE
+          is ShortArrayDump -> record.array.size * HprofReader.SHORT_SIZE
+          is IntArrayDump -> record.array.size * HprofReader.INT_SIZE
+          is LongArrayDump -> record.array.size * HprofReader.LONG_SIZE
+          else -> {
+            throw IllegalStateException("Unexpected record $record")
+          }
+        }
+        retainedSizes[dominatorId] = retainedSize
+      }
+
+      resultsFound.forEach { result ->
+        val leakingInstanceId = result.weakReference.referent.value
+        val instanceRecord = parser.retrieveRecordById(leakingInstanceId) as InstanceDumpRecord
+        val classRecord = parser.retrieveRecordById(instanceRecord.classId) as ClassDumpRecord
+        var retainedSize = retainedSizes.getValue(leakingInstanceId)
+        retainedSize += classRecord.instanceSize
+        retainedSizes[leakingInstanceId] = retainedSize
+      }
+      retainedCounts[InstanceDumpRecord::class] =
+        retainedCounts.getValue(InstanceDumpRecord::class) + resultsFound.size
+
+      // TODO Replace dominators, because the leak is coming from
+      // the top instance and the closest one matters less
+      // This is just an infinite loop that keeps running until no more changes
+
+      // TODO Add this to the result, use an enum, split out for each result
+      CanaryLog.d("Retained counts: $retainedCounts")
+
+      resultsFound.map { result ->
+        result.copy(retainedHeapSize = retainedSizes[result.weakReference.referent.value])
+      }
+    } else {
+      resultsFound
     }
 
     clearState()
@@ -174,6 +275,8 @@ internal class ShortestPathFinder {
     visitedSet.clear()
     visitOrder = 0
     referentMap = emptyMap()
+    undominatedSet.clear()
+    dominatedInstances.clear()
   }
 
   private fun enqueueGcRoots(
@@ -186,6 +289,7 @@ internal class ShortestPathFinder {
     // TODO java local: exclude specific threads,
     // TODO java local: parent should be set to the allocated thread
     gcRootIds.forEach {
+      undominate(it)
       enqueue(hprofParser, RootNode(it), exclusionPriority = null)
     }
   }
@@ -194,7 +298,8 @@ internal class ShortestPathFinder {
     hprofParser: HprofParser,
     record: ClassDumpRecord,
     node: LeakNode,
-    staticFieldNameByClassName: Map<String, Map<String, Exclusion>>
+    staticFieldNameByClassName: Map<String, Map<String, Exclusion>>,
+    computeRetainedHeapSize: Boolean
   ) {
     val className = hprofParser.className(record.id)
 
@@ -205,6 +310,10 @@ internal class ShortestPathFinder {
       val fieldName = hprofParser.hprofStringById(staticField.nameStringId)
       if (fieldName == "\$staticOverhead") {
         continue
+      }
+
+      if (computeRetainedHeapSize) {
+        undominate(objectId)
       }
 
       val leakReference = LeakReference(STATIC_FIELD, fieldName, "object $objectId")
@@ -223,7 +332,8 @@ internal class ShortestPathFinder {
     hprofParser: HprofParser,
     record: InstanceDumpRecord,
     parent: LeakNode,
-    fieldNameByClassName: Map<String, Map<String, Exclusion>>
+    fieldNameByClassName: Map<String, Map<String, Exclusion>>,
+    computeRetainedHeapSize: Boolean
   ) {
     val instance = hprofParser.hydrateInstance(record)
 
@@ -247,6 +357,15 @@ internal class ShortestPathFinder {
     fieldNamesAndValues.filter { (_, value) -> value is ObjectReference }
         .map { (name, reference) -> name to (reference as ObjectReference).value }
         .forEach { (fieldName, objectId) ->
+
+          if (computeRetainedHeapSize) {
+            if (hprofParser.objectIdMetadata(objectId) == CLASS) {
+              undominate(objectId)
+            } else {
+              updateDominator(parent.instance, objectId)
+            }
+          }
+
           val exclusion = ignoredFields[fieldName]
           enqueue(
               hprofParser, ChildNode(
@@ -261,9 +380,17 @@ internal class ShortestPathFinder {
   private fun visitObjectArrayRecord(
     hprofParser: HprofParser,
     record: ObjectArrayDumpRecord,
-    parentNode: LeakNode
+    parentNode: LeakNode,
+    computeRetainedHeapSize: Boolean
   ) {
     record.elementIds.forEachIndexed { index, elementId ->
+      if (computeRetainedHeapSize) {
+        if (hprofParser.objectIdMetadata(elementId) == CLASS) {
+          undominate(elementId)
+        } else {
+          updateDominator(parentNode.instance, elementId)
+        }
+      }
       val name = Integer.toString(index)
       val reference = LeakReference(ARRAY_ENTRY, name, "object $elementId")
       enqueue(hprofParser, ChildNode(elementId, visitOrder++, null, parentNode, reference), null)
@@ -307,6 +434,72 @@ internal class ShortestPathFinder {
     }
     toVisitMap[node.instance] = nodePriority
     toVisitQueue.add(node)
+  }
+
+  private fun updateDominator(
+    parent: Long,
+    instance: Long
+  ) {
+    if (undominatedSet.contains(instance)) {
+      return
+    }
+    val currentDominator = dominatedInstances[instance]
+    val parentDominator = dominatedInstances[parent]
+
+    val parentIsRetainedInstance = referentMap.containsKey(parent)
+
+    val nextDominator = if (parentIsRetainedInstance) parent else parentDominator
+
+    if (nextDominator == null) {
+      // TODO Remove this check once it works and has tests
+      require(undominatedSet.contains(parent))
+      // parent is not a retained instance and parent has no dominator, but it must have been
+      // visited therefore we know parent belongs to undominated.
+      undominatedSet.add(instance)
+
+      if (currentDominator != null) {
+        dominatedInstances.remove(instance)
+      }
+      return
+    }
+    if (currentDominator == null) {
+      dominatedInstances[instance] = nextDominator
+    } else {
+      val parentDominators = mutableListOf<Long>()
+      val currentDominators = mutableListOf<Long>()
+      var dominator: Long? = nextDominator
+      while (dominator != null) {
+        parentDominators.add(dominator)
+        dominator = dominatedInstances[dominator]
+      }
+      dominator = currentDominator
+      while (dominator != null) {
+        currentDominators.add(dominator)
+        dominator = dominatedInstances[dominator]
+      }
+
+      var sharedDominator: Long? = null
+      exit@ for (parentD in parentDominators) {
+        for (currentD in currentDominators) {
+          if (currentD == parentD) {
+            sharedDominator = currentD
+            break@exit
+          }
+        }
+      }
+      if (sharedDominator == null) {
+        dominatedInstances.remove(instance)
+        undominatedSet.add(instance)
+      } else {
+        dominatedInstances[instance] = sharedDominator
+      }
+
+    }
+  }
+
+  private fun undominate(instance: Long) {
+    dominatedInstances.remove(instance)
+    undominatedSet.add(instance)
   }
 
   companion object {

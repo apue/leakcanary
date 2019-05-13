@@ -16,9 +16,7 @@
 package leakcanary
 
 import leakcanary.AnalyzerProgressListener.Step.BUILDING_LEAK_TRACES
-import leakcanary.AnalyzerProgressListener.Step.COMPUTING_DOMINATORS
 import leakcanary.AnalyzerProgressListener.Step.FINDING_LEAKING_REFS
-import leakcanary.AnalyzerProgressListener.Step.FINDING_SHORTEST_PATHS
 import leakcanary.AnalyzerProgressListener.Step.FINDING_WATCHED_REFERENCES
 import leakcanary.AnalyzerProgressListener.Step.READING_HEAP_DUMP_FILE
 import leakcanary.AnalyzerProgressListener.Step.SCANNING_HEAP_DUMP
@@ -122,10 +120,13 @@ class HeapAnalyzer constructor(
               )
 
             val pathResults =
-              findShortestPaths(parser, exclusionsFactory, leakingWeakRefs, gcRootIds)
+              findShortestPaths(
+                  parser, exclusionsFactory, leakingWeakRefs, gcRootIds,
+                  computeRetainedHeapSize
+              )
 
             buildLeakTraces(
-                computeRetainedHeapSize, reachabilityInspectors, labelers, pathResults, parser,
+                reachabilityInspectors, labelers, pathResults, parser,
                 leakingWeakRefs, analysisResults
             )
 
@@ -151,6 +152,7 @@ class HeapAnalyzer constructor(
     var heapDumpMemoryStoreClassId = -1L
     val keyedWeakReferenceInstances = mutableListOf<InstanceDumpRecord>()
     val gcRootIds = mutableListOf<Long>()
+    val cleaners = mutableListOf<Long>()
     val callbacks = RecordCallbacks()
         .on(StringRecord::class.java) {
           if (it.string == KeyedWeakReference::class.java.name) {
@@ -169,6 +171,9 @@ class HeapAnalyzer constructor(
         .on(InstanceDumpRecord::class.java) {
           if (it.classId == keyedWeakReferenceClassId) {
             keyedWeakReferenceInstances.add(it)
+          }
+          if (parser.className(it.classId) == "sun.misc.Cleaner") {
+            cleaners.add(it.id)
           }
         }
         .on(GcRootRecord::class.java) {
@@ -194,6 +199,38 @@ class HeapAnalyzer constructor(
           }
         }
     parser.scan(callbacks)
+
+    // TODO Move this to where we compute retained size.
+    val sizes = mutableMapOf<String, Pair<Int, Long>>().withDefault { 0 to 0L }
+    with(parser) {
+      cleaners.forEach {
+        val cleaner = it.hydratedInstance
+        val thunkRef = cleaner["thunk"]
+        val referent = cleaner["referent"]
+        val thunkRunnable = thunkRef.reference?.hydratedInstance
+        if (thunkRunnable != null && !referent.isNullReference) {
+          if (thunkRunnable.classHierarchy[0].className == "libcore.util.NativeAllocationRegistry\$CleanerThunk") {
+            val nar = thunkRunnable["this\$0"].reference?.hydratedInstance
+            if (nar != null) {
+              if (nar.classHierarchy[0].className == "libcore.util.NativeAllocationRegistry") {
+                val nativeInstance = referent.reference!!.hydratedInstance
+                val className = nativeInstance.classHierarchy[0].className
+                val (count, size) = sizes.getValue(className)
+                sizes[className] = count + 1 to (size + nar["size"].long!!)
+              }
+            }
+          }
+        }
+
+      }
+    }
+    for ((className, pair) in sizes) {
+      val (count, size) = pair
+      CanaryLog.d("$count $className, $size bytes")
+    }
+
+
+
     return Triple(gcRootIds, heapDumpMemoryStoreClassId, keyedWeakReferenceInstances)
   }
 
@@ -252,16 +289,16 @@ class HeapAnalyzer constructor(
     parser: HprofParser,
     exclusionsFactory: ExclusionsFactory,
     leakingWeakRefs: List<KeyedWeakReferenceMirror>,
-    gcRootIds: MutableList<Long>
+    gcRootIds: MutableList<Long>,
+    computeRetainedHeapSize: Boolean
   ): List<Result> {
-    listener.onProgressUpdate(FINDING_SHORTEST_PATHS)
-
     val pathFinder = ShortestPathFinder()
-    return pathFinder.findPaths(parser, exclusionsFactory, leakingWeakRefs, gcRootIds)
+    return pathFinder.findPaths(
+        parser, exclusionsFactory, leakingWeakRefs, gcRootIds, computeRetainedHeapSize, listener
+    )
   }
 
   private fun buildLeakTraces(
-    computeRetainedHeapSize: Boolean,
     leakInspectors: List<LeakInspector>,
     labelers: List<Labeler>,
     pathResults: List<Result>,
@@ -269,12 +306,6 @@ class HeapAnalyzer constructor(
     leakingWeakRefs: MutableList<KeyedWeakReferenceMirror>,
     analysisResults: MutableMap<String, RetainedInstance>
   ) {
-    if (computeRetainedHeapSize && pathResults.isNotEmpty()) {
-      listener.onProgressUpdate(COMPUTING_DOMINATORS)
-      // Computing dominators has the side effect of computing retained size.
-      CanaryLog.d("Cannot compute retained heap size because dominators is not implemented yet")
-    }
-
     listener.onProgressUpdate(BUILDING_LEAK_TRACES)
 
     pathResults.forEach { pathResult ->
@@ -294,8 +325,6 @@ class HeapAnalyzer constructor(
       val instanceClassName =
         recordClassName(parser.retrieveRecordById(pathResult.leakingNode.instance), parser)
 
-      // TODO Compute retained heap size
-      val retainedSize = null
       val key = parser.retrieveString(weakReference.key)
       val leakDetected = LeakingInstance(
           referenceKey = key,
@@ -303,7 +332,7 @@ class HeapAnalyzer constructor(
           instanceClassName = instanceClassName,
           watchDurationMillis = weakReference.watchDurationMillis,
           exclusionStatus = pathResult.exclusionStatus, leakTrace = leakTrace,
-          retainedHeapSize = retainedSize
+          retainedHeapSize = pathResult.retainedHeapSize
       )
       analysisResults[key] = leakDetected
     }

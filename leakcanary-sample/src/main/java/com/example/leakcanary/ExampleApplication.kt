@@ -18,6 +18,7 @@ package com.example.leakcanary
 import android.app.Application
 import android.os.StrictMode
 import android.view.View
+import leakcanary.LeakCanary
 
 open class ExampleApplication : Application() {
   val leakedViews = mutableListOf<View>()
@@ -25,6 +26,8 @@ open class ExampleApplication : Application() {
   override fun onCreate() {
     super.onCreate()
     enabledStrictMode()
+
+    LeakCanary.config = LeakCanary.config.copy(computeRetainedHeapSize = true)
   }
 
   private fun enabledStrictMode() {

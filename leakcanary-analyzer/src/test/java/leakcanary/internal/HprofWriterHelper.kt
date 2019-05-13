@@ -25,6 +25,7 @@ import leakcanary.Record.LoadClassRecord
 import leakcanary.Record.StringRecord
 import okio.Buffer
 import java.io.Closeable
+import java.io.File
 import java.util.UUID
 import kotlin.reflect.KClass
 
@@ -36,7 +37,22 @@ class HprofWriterHelper constructor(
   private val id: Long
     get() = ++lastId
 
+  private val typeSizes = mapOf(
+      // object
+      HprofReader.OBJECT_TYPE to writer.idSize,
+      HprofReader.BOOLEAN_TYPE to HprofReader.BOOLEAN_SIZE,
+      HprofReader.CHAR_TYPE to HprofReader.CHAR_SIZE,
+      HprofReader.FLOAT_TYPE to HprofReader.FLOAT_SIZE,
+      HprofReader.DOUBLE_TYPE to HprofReader.DOUBLE_SIZE,
+      HprofReader.BYTE_TYPE to HprofReader.BYTE_SIZE,
+      HprofReader.SHORT_TYPE to HprofReader.SHORT_SIZE,
+      HprofReader.INT_TYPE to HprofReader.INT_SIZE,
+      HprofReader.LONG_TYPE to HprofReader.LONG_SIZE
+  )
+
   private val weakRefKeys = mutableSetOf<Long>()
+
+  private val classDumps = mutableMapOf<Long, ClassDumpRecord>()
 
   private val objectClassId = clazz(superClassId = 0, className = "java.lang.Object")
   private val stringClassId = clazz(
@@ -84,6 +100,19 @@ class HprofWriterHelper constructor(
       writer.write(fieldName)
       FieldRecord(fieldName.id, typeOf(it.second))
     }
+
+    var instanceSize = fieldRecords.sumBy {
+      typeSizes.getValue(it.type)
+    }
+
+    var nextUpId = if (superClassId == -1L) objectClassId else superClassId
+    while (nextUpId != 0L) {
+      val nextUp = classDumps[nextUpId]!!
+      instanceSize += nextUp.fields.sumBy {
+        typeSizes.getValue(it.type)
+      }
+      nextUpId = nextUp.superClassId
+    }
     val classDump = ClassDumpRecord(
         id = loadClass.id,
         stackTraceSerialNumber = 1,
@@ -91,10 +120,11 @@ class HprofWriterHelper constructor(
         classLoaderId = 0,
         signersId = 0,
         protectionDomainId = 0,
-        instanceSize = 0,
+        instanceSize = instanceSize,
         staticFields = staticFieldRecords,
         fields = fieldRecords
     )
+    classDumps[loadClass.id] = classDump
     writer.write(classDump)
     val gcRootRecord = GcRootRecord(gcRoot = StickyClass(classDump.id))
     writer.write(gcRootRecord)
@@ -151,6 +181,46 @@ class HprofWriterHelper constructor(
     )
     writer.write(instanceDump)
     return instanceDump.id
+  }
+
+  inner class InstanceAndClassDefinition {
+    val field = LinkedHashMap<String, HeapValue>()
+    val staticField = LinkedHashMap<String, HeapValue>()
+  }
+
+  inner class ClassDefinition {
+    val staticField = LinkedHashMap<String, HeapValue>()
+  }
+
+  infix fun String.watchedInstance(block: InstanceAndClassDefinition.() -> Unit): ObjectReference {
+    val instance = this.instance(block)
+    keyedWeakReference("DummyClassName", instance.value)
+    return instance
+  }
+
+  infix fun String.instance(block: InstanceAndClassDefinition.() -> Unit): ObjectReference {
+    val definition = InstanceAndClassDefinition()
+    block(definition)
+
+    val classFields = definition.field.map {
+      it.key to it.value::class
+    }
+
+    val staticFields = definition.staticField.map { it.key to it.value }
+
+    val instanceFields = definition.field.map { it.value }
+
+    val id =
+      instance(clazz(this, fields = classFields, staticFields = staticFields), instanceFields)
+    return ObjectReference(id)
+  }
+
+  infix fun String.clazz(block: ClassDefinition.() -> Unit): Long {
+    val definition = ClassDefinition()
+    block(definition)
+
+    val staticFields = definition.staticField.map { it.key to it.value }
+    return clazz(this, staticFields = staticFields)
   }
 
   fun array(array: CharArray): Long {
@@ -210,6 +280,10 @@ class HprofWriterHelper constructor(
     )
     writer.close()
   }
+}
+
+fun File.dump(block: HprofWriterHelper.() -> Unit) {
+  HprofWriterHelper(HprofWriter.open(this)).use(block)
 }
 
 fun HprofWriter.helper(block: HprofWriterHelper.() -> Unit) {

@@ -68,30 +68,6 @@ fun File.writeSinglePathsToCharArrays(values: List<CharArray>) {
       }
 }
 
-fun File.writeCustomPathToInstance(path: List<Pair<String, String>>) {
-  HprofWriter.open(this)
-      .helper {
-        val leaking = instance(
-            clazz("Leaking")
-        )
-        keyedWeakReference("Leaking", leaking)
-        var previousInstance = leaking
-        for (index in path.lastIndex downTo 1) {
-          val (className, fieldName) = path[index]
-          previousInstance = instance(
-              clazz(className, fields = listOf(fieldName to ObjectReference::class)),
-              fields = listOf(ObjectReference(previousInstance))
-          )
-        }
-        val root = path.first()
-        clazz(
-            root.first, staticFields = listOf(
-            root.second to ObjectReference(previousInstance)
-        )
-        )
-      }
-}
-
 fun File.writeTwoPathsToInstance() {
   HprofWriter.open(this)
       .helper {

@@ -32,9 +32,6 @@ object LeakCanary {
     val exclusionsFactory: ExclusionsFactory = exclusionsFactory(
         AndroidExcludedRefs.appDefaults
     ),
-    /**
-     * Note: this is currently not implemented in the new heap parser.
-     */
     val computeRetainedHeapSize: Boolean = false,
     val leakInspectors: List<LeakInspector> = AndroidLeakInspectors.defaultAndroidInspectors(),
     val labelers: List<Labeler> = AndroidLabelers.defaultAndroidLabelers(

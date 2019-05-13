@@ -81,6 +81,9 @@ class HprofParser private constructor(
   val position
     get() = reader.position
 
+  val idSize
+    get() = reader.idSize
+
   /**
    * Map of string id to string
    * This currently keeps all the hprof strings that we could care about: class names,

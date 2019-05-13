@@ -22,11 +22,12 @@ import java.lang.ref.WeakReference
 fun <T : HeapAnalysis> File.checkForLeaks(
   labelers: List<Labeler> = emptyList(),
   leakInspectors: List<LeakInspector> = emptyList(),
+  computeRetainedHeapSize: Boolean = false,
   exclusionsFactory: ExclusionsFactory = defaultExclusionsFactory
 ): T {
   val heapAnalyzer = HeapAnalyzer(AnalyzerProgressListener.NONE)
   return heapAnalyzer.checkForLeaks(
-      this, exclusionsFactory, false, leakInspectors, labelers
+      this, exclusionsFactory, computeRetainedHeapSize, leakInspectors, labelers
   ) as T
 }
 

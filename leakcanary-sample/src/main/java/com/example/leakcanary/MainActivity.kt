@@ -21,7 +21,6 @@ import android.view.View
 import kotlin.random.Random
 
 class MainActivity : Activity() {
-
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     setContentView(R.layout.main_activity)
